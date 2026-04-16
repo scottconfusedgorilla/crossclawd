@@ -7,3 +7,4 @@ node_modules/
 dist/
 *.opencatalog
 !exporter/samples/*.opencatalog
+tmp/

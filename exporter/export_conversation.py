@@ -1,209 +1,143 @@
-"""CrossClawd exporter — build an encrypted .opencatalog from a Claude conversation.
+"""CrossClawd exporter v0.2 — build an encrypted .opencatalog from a Claude conversation.
+
+v0.2 auto-discovers Claude Code's JSONL transcripts from ~/.claude/projects/,
+parses them (ccc-ninja compatible), and bundles:
+  - {slug}.opencatalog — structured catdef v1.3 index (exchanges, topics, importance)
+  - transcript.md — verbatim ccc-ninja-style markdown of the full session
 
 Usage:
-    # Produce a bundle file (no upload)
+    # Auto-find latest session, write bundle
     python export_conversation.py --out session.opencatalog
 
-    # Produce, encrypt, upload to crossclawd.com, get a pickup code
-    python export_conversation.py --upload
+    # Pick a specific project's latest session
+    python export_conversation.py --project thingalog --out session.opencatalog
 
-This is the v0.1 proof-of-concept. A future version will ingest a live
-Claude conversation payload (via hook or clipboard); this version has
-the conversation beats hardcoded in BEATS below — edit for your session.
+    # Specific session file
+    python export_conversation.py --jsonl ~/.claude/projects/.../xxx.jsonl --out session.opencatalog
+
+    # Encrypt + upload to relay, get pickup code
+    python export_conversation.py --upload
 """
+from __future__ import annotations
+
 import argparse
 import base64
 import json
-import os
 import secrets
 import sys
-import uuid
 import zipfile
 from datetime import datetime, timezone
 from io import BytesIO
 from pathlib import Path
 from urllib import request, error
 
+from ccc_parser import (
+    ParsedMessage,
+    parse_jsonl,
+    format_markdown,
+    list_projects,
+    list_sessions,
+    find_latest_session,
+    CLAUDE_PROJECTS_DIR,
+)
+
 # ── Config ──────────────────────────────────────────────────────
-
 DEFAULT_RELAY = "https://crossclawd.com"
-DEFAULT_TTL_SECONDS = 3600  # 60 minutes
+DEFAULT_TTL_SECONDS = 3600
 
-# ── The conversation to export ──────────────────────────────────
-# In v0.1, edit these beats by hand. A future version will ingest a live transcript.
+# ── Build catdef from parsed messages ───────────────────────────
 
-SESSION_META = {
-    "slug": "claude-session-2026-04-16",
-    "name": "Claude Session — YVR/Laptop 2026-04-16",
-    "tagline": "CrossClawd v0.1 — conversation exported as a portable catalog",
-    "owner": "Scott",
-    "email": "scott@confusedgorilla.com",
-    "description": "<p>A proof-of-concept: every Claude conversation is a Thing in a catalog.</p>",
-    "about": "<p>Produced by Claude (Opus 4.6, 1M context).</p>",
-    "participants": "<p><strong>Scott</strong> + <strong>Claude</strong> (Opus 4.6)</p>",
-    "arc": "<p>Perf tuning → date-forward catalogs → partner platform → catdef v1.3 handoff → CrossClawd invention.</p>",
-}
+def build_catdef(messages: list[ParsedMessage], session_id: str, project_name: str) -> dict:
+    """Generate a structured catdef v1.3 index of the conversation.
 
-TOPICS = {
-    "Performance": "Profiling, caching, speed improvements",
-    "Subcats": "Mini-catalogs for enumerated values",
-    "Spec (catdef)": "The open standard for catalog definitions",
-    "Partner platform": "White-label, inheritance, revenue share",
-    "Date-forward": "Calendar as a view over a catalog",
-    "Embed/Distribution": "Embed codes, mobile, PWA, Thingstick",
-    "Demo strategy": "Demo-god moments, quote capture, pitch path",
-    "Handoff/Governance": "Brother-Claude takes catdef, I become a user",
-    "MCP/Integrations": "dangerstorm-as-integrations, MCP native creation",
-    "Cross-machine": "CrossClawd — this very idea",
-    "Build (in-flight)": "Features actively being implemented",
-}
+    v0.2: mechanical index — one Exchange per user-assistant beat.
+    v0.3 will use Claude to summarize into topics/importance.
+    """
+    # Group into exchanges (user turn → assistant responses until next user turn)
+    exchanges = []
+    current: dict | None = None
+    turn_num = 0
 
-IMPORTANCE = {
-    "Foundational": "Architectural primitives everything else depends on",
-    "Major": "Significant product/business direction",
-    "Significant": "Meaningful feature or insight",
-    "Minor": "Useful detail or small win",
-}
+    for m in messages:
+        if m.role == "user":
+            if current:
+                exchanges.append(current)
+            turn_num += 1
+            # Truncate user content for summary (full thing available in transcript)
+            snippet = (m.content[:120] + "…") if len(m.content) > 120 else m.content
+            current = {
+                "turn": turn_num,
+                "timestamp": m.timestamp,
+                "user_snippet": snippet,
+                "user_full": m.content,
+                "assistant_parts": [],
+                "tool_calls": [],
+                "models": set(),
+            }
+        elif m.role == "assistant":
+            if current is None:
+                continue
+            snippet = (m.content[:120] + "…") if len(m.content) > 120 else m.content
+            current["assistant_parts"].append(snippet)
+            if m.model:
+                current["models"].add(m.model)
+        elif m.role == "tool_use":
+            if current is None:
+                continue
+            tool_label = m.tool_name or "?"
+            if m.tool_description:
+                tool_label += f"({m.tool_description[:50]})"
+            current["tool_calls"].append(tool_label)
 
-BEATS = [
-    {"turn": 1, "summary": "Perf tuning: middleware caching (slug + token) + batch Sub-Catalogs endpoint",
-     "topics": ["Performance"], "importance": "Foundational",
-     "decision": "Major speed wins. ~1s saved per API call.", "artifacts": "commit 6b4866d"},
+    if current:
+        exchanges.append(current)
 
-    {"turn": 2, "summary": "Fixed slug cache poisoning on brand new catalogs",
-     "topics": ["Performance"], "importance": "Significant",
-     "decision": "Stop caching None. Invalidate on create.", "artifacts": "commit 34418b2"},
+    # Build catdef items
+    items = []
+    for ex in exchanges:
+        ex_summary = ex["user_snippet"] or f"Turn {ex['turn']}"
+        items.append({
+            "_id": f"exchange-{ex['turn']:04d}",
+            "template": "Exchange",
+            "fields": {
+                "Summary": ex_summary,
+                "Turn": ex["turn"],
+                "Timestamp": ex["timestamp"][:10] if ex["timestamp"] else "",
+                "Model": ", ".join(sorted(ex["models"])) if ex["models"] else "",
+                "Tool calls": len(ex["tool_calls"]),
+                "User said": ex["user_full"][:500] + ("…" if len(ex["user_full"]) > 500 else ""),
+                "Assistant replied": " | ".join(ex["assistant_parts"])[:500],
+            },
+        })
 
-    {"turn": 3, "summary": "Switched template generation to Haiku",
-     "topics": ["Performance"], "importance": "Significant",
-     "decision": "~6s saved. Both AI calls now Haiku.", "artifacts": "commit 754e8c3"},
+    # Compute summary stats
+    total_user = sum(1 for m in messages if m.role == "user")
+    total_assist = sum(1 for m in messages if m.role == "assistant")
+    total_tools = sum(1 for m in messages if m.role == "tool_use")
+    models = sorted({m.model for m in messages if m.model})
+    first_ts = messages[0].timestamp if messages else ""
+    last_ts = messages[-1].timestamp if messages else ""
 
-    {"turn": 4, "summary": "7-day reflection: graph-DB curiosity to billion-dollar SaaS",
-     "topics": ["Demo strategy"], "importance": "Major",
-     "decision": "Architecture stayed coherent. No pivots.", "artifacts": ""},
-
-    {"turn": 5, "summary": "CATIO could transport PXMemo-style graph collections",
-     "topics": ["Subcats", "Spec (catdef)"], "importance": "Major",
-     "decision": "Recursive subcats permitted in spec, NOT in Thingalog.", "artifacts": ""},
-
-    {"turn": 6, "summary": "L'Amour flyer = concert calendar = date-forward catalog",
-     "topics": ["Date-forward", "Demo strategy"], "importance": "Foundational",
-     "decision": "Calendar = catalog with date as primary axis.", "artifacts": "project_date_forward_catalogs.md"},
-
-    {"turn": 7, "summary": "Context-aware rendering per-kiosk (geo/time weighting)",
-     "topics": ["Date-forward", "Embed/Distribution"], "importance": "Significant",
-     "decision": "Scorable fields + environment hints.", "artifacts": ""},
-
-    {"turn": 8, "summary": "Partner white-label with custom domain mapping",
-     "topics": ["Partner platform"], "importance": "Major",
-     "decision": "Watchomatic ships *.watchomatic.app. Revenue share. inherits_from catdef field.", "artifacts": "project_catdef_marketplace.md"},
-
-    {"turn": 9, "summary": "Partner-scoped themes/views only for their customers",
-     "topics": ["Partner platform"], "importance": "Major",
-     "decision": "scope=inherits_from:model. Partners compete on experience layer.", "artifacts": ""},
-
-    {"turn": 10, "summary": "thingalog.com/integrations IS dangerstorm — generates build prompts, not hosted",
-     "topics": ["MCP/Integrations"], "importance": "Foundational",
-     "decision": "Infinite integrations vs Zapier's 5000. Zero infra.", "artifacts": "project_integrations_dangerstorm.md"},
-
-    {"turn": 11, "summary": "Thingstick: HDMI dongle, plug-scan-QR-kiosk in 20 seconds",
-     "topics": ["Embed/Distribution"], "importance": "Major",
-     "decision": "$15 OEM, $49-79 retail. Partner variants.", "artifacts": "project_thingstick.md"},
-
-    {"turn": 12, "summary": "Live demo: generate Thingstick setup via dangerstorm on stage",
-     "topics": ["Demo strategy", "MCP/Integrations"], "importance": "Significant",
-     "decision": "Demo-god move: invent the pipeline with any generic stick.", "artifacts": ""},
-
-    {"turn": 13, "summary": "'Transparency' as brand through-line",
-     "topics": ["Demo strategy"], "importance": "Major",
-     "decision": "System shows reasoning. Customer said 'I'd pay JUST for that'.", "artifacts": "feedback_diagnostic_transparency.md"},
-
-    {"turn": 14, "summary": "Quote capture at peak emotion (sncro pattern)",
-     "topics": ["Demo strategy"], "importance": "Significant",
-     "decision": "AI-drafted quotes post-'holy shit' moments.", "artifacts": "project_quote_capture.md"},
-
-    {"turn": 15, "summary": "catdef spec completeness: 7/10",
-     "topics": ["Spec (catdef)"], "importance": "Significant",
-     "decision": "Strong bones; gaps in permissions, i18n, API doc.", "artifacts": ""},
-
-    {"turn": 16, "summary": "HANDOFF: catdef stewardship to brother-Claude",
-     "topics": ["Handoff/Governance", "Spec (catdef)"], "importance": "Foundational",
-     "decision": "catdef independent. I'm implementer/user. CONTRIBUTING.md written.", "artifacts": "feedback_catdef_governance.md"},
-
-    {"turn": 17, "summary": "catdef v1.3 finalized",
-     "topics": ["Spec (catdef)"], "importance": "Major",
-     "decision": "inherits_from, views, range, scorable, subcat images+seeds, About page, embed.", "artifacts": "commit 75679cb"},
-
-    {"turn": 18, "summary": "Cross-machine plane session. Priority list re-derived.",
-     "topics": ["Build (in-flight)"], "importance": "Significant",
-     "decision": "Build #1-5 in order. Fast wins first.", "artifacts": ""},
-
-    {"turn": 19, "summary": "SHIPPED: in-progress cookie for crash recovery",
-     "topics": ["Build (in-flight)"], "importance": "Significant",
-     "decision": "tl_pending cookie. Continue banner. claim_token fallback.", "artifacts": "commit 56fcdce"},
-
-    {"turn": 20, "summary": "SHIPPED: embed codes with Settings tab + live preview",
-     "topics": ["Build (in-flight)", "Embed/Distribution"], "importance": "Significant",
-     "decision": "?embed=true mode. CSS hides chrome. iframe snippet.", "artifacts": "commit 56fcdce"},
-
-    {"turn": 21, "summary": "Battery crisis. Committed. Remaining features deferred.",
-     "topics": ["Build (in-flight)"], "importance": "Minor",
-     "decision": "About page, subcat images, transparency pending.", "artifacts": ""},
-
-    {"turn": 22, "summary": "MCP-native catalog creation logged",
-     "topics": ["MCP/Integrations"], "importance": "Major",
-     "decision": "AI agents create catalogs programmatically via MCP.", "artifacts": "project_mcp_native_creation.md"},
-
-    {"turn": 23, "summary": "Switching to desktop. Dormant chat note written.",
-     "topics": ["Cross-machine"], "importance": "Major",
-     "decision": "MEMORY.md preserves substance; vibe re-emerges after a few messages.", "artifacts": "project_where_we_left_off.md"},
-
-    {"turn": 24, "summary": "CROSSCLAWD invented: built on Thingalog itself",
-     "topics": ["Cross-machine", "MCP/Integrations"], "importance": "Foundational",
-     "decision": "Every conversation = Thing. Ultimate dogfood.", "artifacts": "project_crossclawd.md"},
-
-    {"turn": 25, "summary": "Build the first .opencatalog of this conversation",
-     "topics": ["Cross-machine", "Build (in-flight)"], "importance": "Foundational",
-     "decision": "CrossClawd v0.1 shipped. Proof-of-concept real.", "artifacts": "this file"},
-
-    {"turn": 26, "summary": "Architecture refined: sncro-style relay for encrypted one-shot context handoff",
-     "topics": ["Cross-machine"], "importance": "Foundational",
-     "decision": "9-digit code, encrypted at rest, consumed on pickup, 60-min TTL. Relay never sees plaintext.", "artifacts": "ARCHITECTURE.md"},
-]
-
-
-# ── Build catdef ────────────────────────────────────────────────
-
-def build_catdef() -> dict:
-    topics_used = {t for b in BEATS for t in b["topics"]}
-    importance_used = {b["importance"] for b in BEATS}
-
-    items = [{
-        "_id": f"beat-{b['turn']:03d}",
-        "template": "Exchange",
-        "fields": {
-            "Summary": b["summary"],
-            "Turn": b["turn"],
-            "Topic": b["topics"],
-            "Importance": b["importance"],
-            "Decision": b["decision"],
-            "Artifacts": b["artifacts"],
-        }
-    } for b in BEATS]
-
+    slug = f"session-{session_id[:8]}"
     return {
         "catdef": "1.3",
         "product": {
-            "name": SESSION_META["name"],
-            "slug": SESSION_META["slug"],
-            "tagline": SESSION_META["tagline"],
-            "description": SESSION_META["description"],
-            "owner": SESSION_META["owner"],
-            "contact_email": SESSION_META["email"],
+            "name": f"Claude session — {project_name}",
+            "slug": slug,
+            "tagline": f"{total_user} user turns, {total_assist} assistant turns, {total_tools} tool calls",
+            "description": f"<p>Session from project <code>{project_name}</code>, ID <code>{session_id}</code>. "
+                           f"Spans <strong>{first_ts[:10]}</strong> to <strong>{last_ts[:10]}</strong>. "
+                           f"Models used: {', '.join(models) if models else 'unknown'}.</p>",
             "sections": [
-                {"title": "About this bundle", "content": SESSION_META["about"]},
-                {"title": "Participants", "content": SESSION_META["participants"]},
-                {"title": "Session arc", "content": SESSION_META["arc"]},
+                {"title": "About this bundle",
+                 "content": "<p>CrossClawd v0.2 bundle. Contains a structured index of conversation exchanges "
+                            "plus the full verbatim transcript as <code>transcript.md</code>.</p>"},
+                {"title": "Contents",
+                 "content": f"<ul>"
+                            f"<li><strong>{len(items)} exchanges</strong> as structured Exchange items</li>"
+                            f"<li><strong>{total_tools} tool calls</strong> inlined in transcript.md</li>"
+                            f"<li><strong>Full verbatim markdown</strong> in transcript.md</li>"
+                            f"</ul>"},
             ],
         },
         "views": {
@@ -214,88 +148,97 @@ def build_catdef() -> dict:
         },
         "templates": [{
             "name": "Exchange",
-            "description": "One back-and-forth beat in a Claude conversation",
             "icon": "💬",
+            "description": "One user turn + its assistant response(s)",
             "field_defs": [
                 {"label": "Summary", "type": "String", "sort_order": 10, "required": True, "primary": True},
                 {"label": "Turn", "type": "Integer", "sort_order": 20, "scorable": "recency"},
-                {"label": "Topic", "type": "Enumerated", "target": "Topic", "multi": True, "sort_order": 30, "filterable": True},
-                {"label": "Importance", "type": "Enumerated", "target": "Importance", "sort_order": 40, "filterable": True},
-                {"label": "Decision", "type": "RichText", "sort_order": 50},
-                {"label": "Artifacts", "type": "String", "sort_order": 60},
+                {"label": "Timestamp", "type": "Date", "sort_order": 30, "scorable": "recency"},
+                {"label": "Model", "type": "String", "sort_order": 40},
+                {"label": "Tool calls", "type": "Integer", "sort_order": 50},
+                {"label": "User said", "type": "RichText", "sort_order": 60},
+                {"label": "Assistant replied", "type": "RichText", "sort_order": 70},
             ],
         }],
-        "subcats": {
-            "Topic": {
-                "field_defs": [{"label": "Description", "type": "String", "sort_order": 10}],
-                "values": {k: {"Description": v} for k, v in TOPICS.items() if k in topics_used},
-            },
-            "Importance": {
-                "field_defs": [{"label": "Notes", "type": "String", "sort_order": 10}],
-                "values": {k: {"Notes": v} for k, v in IMPORTANCE.items() if k in importance_used},
-            },
-        },
+        "subcats": {},
         "settings": {"public": False, "export": {"zip": True}},
         "data": {"items": items},
         "x.crossclawd.session": {
-            "source": "Claude Code (Opus 4.6, 1M context)",
+            "source": "Claude Code JSONL via ccc-parser (Python port of ccc-ninja)",
+            "session_id": session_id,
+            "project": project_name,
             "exported_at": datetime.now(timezone.utc).isoformat(),
-            "format_version": "0.1",
+            "exporter_version": "0.2",
+            "stats": {
+                "user_turns": total_user,
+                "assistant_turns": total_assist,
+                "tool_calls": total_tools,
+                "models_used": models,
+                "first_timestamp": first_ts,
+                "last_timestamp": last_ts,
+            },
         },
     }
 
 
-def build_bundle(catdef: dict, slug: str) -> bytes:
-    """Build the .opencatalog ZIP bytes."""
+def build_bundle(catdef: dict, transcript_md: str) -> bytes:
+    """Build a .opencatalog ZIP containing the catdef + transcript."""
+    slug = catdef["product"]["slug"]
     buf = BytesIO()
-    with zipfile.ZipFile(buf, 'w', zipfile.ZIP_DEFLATED) as z:
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
         z.writestr(f"{slug}.opencatalog", json.dumps(catdef, indent=2, ensure_ascii=False))
-        z.writestr("README.md", f"""# {catdef['product']['name']}
+        z.writestr("transcript.md", transcript_md)
+
+        stats = catdef.get("x.crossclawd.session", {}).get("stats", {})
+        readme = f"""# {catdef['product']['name']}
 
 {catdef['product']['tagline']}
 
 ## Stats
-- Exchanges: {len(catdef['data']['items'])}
-- Topics: {len(catdef['subcats']['Topic']['values'])}
-- Importance tiers: {len(catdef['subcats']['Importance']['values'])}
-- Format: catdef v1.3
+- User turns: {stats.get('user_turns', 0)}
+- Assistant turns: {stats.get('assistant_turns', 0)}
+- Tool calls: {stats.get('tool_calls', 0)}
+- Models: {', '.join(stats.get('models_used', []))}
+- Span: {stats.get('first_timestamp', '?')[:10]} → {stats.get('last_timestamp', '?')[:10]}
 
-Generated: {datetime.now(timezone.utc).isoformat()}
-""")
+## Files
+- `{slug}.opencatalog` — structured catdef v1.3 index ({len(catdef['data']['items'])} Exchange items)
+- `transcript.md` — verbatim markdown transcript
+
+## Usage
+Drop on any catdef v1.3 renderer, or import into Thingalog.
+Hand to another Claude to pick up context.
+
+Exported: {datetime.now(timezone.utc).isoformat()}
+"""
+        z.writestr("README.md", readme)
     return buf.getvalue()
 
 
 # ── Encryption ──────────────────────────────────────────────────
 
 def encrypt(plaintext: bytes) -> tuple[bytes, bytes]:
-    """AES-256-GCM encrypt. Returns (ciphertext_with_iv_and_tag, key)."""
     try:
         from cryptography.hazmat.primitives.ciphers.aead import AESGCM
     except ImportError:
-        print("ERROR: cryptography package required. pip install cryptography", file=sys.stderr)
+        print("ERROR: pip install cryptography", file=sys.stderr)
         sys.exit(1)
 
     key = AESGCM.generate_key(bit_length=256)
-    aesgcm = AESGCM(key)
-    iv = secrets.token_bytes(12)  # 96-bit IV for GCM
-    ciphertext = aesgcm.encrypt(iv, plaintext, associated_data=None)
-    # Prepend IV so decrypter can find it: [12 bytes IV][ciphertext+tag]
+    iv = secrets.token_bytes(12)
+    ciphertext = AESGCM(key).encrypt(iv, plaintext, associated_data=None)
     return iv + ciphertext, key
 
 
 def upload(relay: str, ciphertext: bytes, ttl: int) -> dict:
-    """POST the ciphertext to the relay. Returns the relay's response."""
     req = request.Request(
         f"{relay}/context",
         data=ciphertext,
         method="POST",
-        headers={
-            "Content-Type": "application/octet-stream",
-            "X-TTL-Seconds": str(ttl),
-        },
+        headers={"Content-Type": "application/octet-stream", "X-TTL-Seconds": str(ttl)},
     )
     try:
-        with request.urlopen(req, timeout=30) as resp:
+        with request.urlopen(req, timeout=60) as resp:
             return json.loads(resp.read().decode())
     except error.HTTPError as e:
         print(f"ERROR: relay returned {e.code}: {e.read().decode()[:200]}", file=sys.stderr)
@@ -308,47 +251,96 @@ def upload(relay: str, ciphertext: bytes, ttl: int) -> dict:
 # ── CLI ─────────────────────────────────────────────────────────
 
 def main():
-    p = argparse.ArgumentParser(description="Build & optionally upload a CrossClawd conversation bundle")
-    p.add_argument("--out", type=Path, help="Write the unencrypted .opencatalog to this path")
-    p.add_argument("--upload", action="store_true", help="Encrypt + upload to the relay, print pickup code")
-    p.add_argument("--relay", default=DEFAULT_RELAY, help=f"Relay URL (default: {DEFAULT_RELAY})")
-    p.add_argument("--ttl", type=int, default=DEFAULT_TTL_SECONDS, help="Seconds before expiry (default: 3600)")
+    p = argparse.ArgumentParser(description="Export a Claude Code conversation as a CrossClawd bundle")
+    p.add_argument("--jsonl", type=Path, help="Explicit path to a session .jsonl file")
+    p.add_argument("--project", help="Filter by project name substring (e.g. 'thingalog')")
+    p.add_argument("--list", action="store_true", help="List available projects/sessions and exit")
+    p.add_argument("--out", type=Path, help="Write the .opencatalog to this path")
+    p.add_argument("--upload", action="store_true", help="Encrypt + upload to relay")
+    p.add_argument("--relay", default=DEFAULT_RELAY)
+    p.add_argument("--ttl", type=int, default=DEFAULT_TTL_SECONDS)
+    p.add_argument("--include-tool-results", action="store_true", help="Include tool result blocks in transcript.md")
     args = p.parse_args()
 
-    if not args.out and not args.upload:
-        p.error("specify at least one of --out or --upload")
+    if args.list:
+        projects = list_projects()
+        if not projects:
+            print(f"No Claude projects found under {CLAUDE_PROJECTS_DIR}", file=sys.stderr)
+            sys.exit(1)
+        print(f"Projects under {CLAUDE_PROJECTS_DIR}:")
+        for pdir in projects:
+            sessions = list_sessions(pdir)
+            print(f"  {pdir.name}  ({len(sessions)} sessions)")
+            for s in sessions[:3]:
+                mt = datetime.fromtimestamp(s.stat().st_mtime).strftime("%Y-%m-%d %H:%M")
+                size = s.stat().st_size
+                print(f"    {s.name}  {mt}  {size:,} bytes")
+        return
 
-    catdef = build_catdef()
-    bundle_bytes = build_bundle(catdef, SESSION_META["slug"])
+    if not args.out and not args.upload:
+        p.error("specify --out and/or --upload")
+
+    # Resolve source JSONL
+    if args.jsonl:
+        jsonl_path = args.jsonl
+        if not jsonl_path.exists():
+            print(f"ERROR: {jsonl_path} not found", file=sys.stderr)
+            sys.exit(1)
+    else:
+        jsonl_path = find_latest_session(project_slug=args.project)
+        if not jsonl_path:
+            print(f"ERROR: no sessions found" + (f" for project '{args.project}'" if args.project else ""), file=sys.stderr)
+            sys.exit(1)
+
+    print(f"Parsing: {jsonl_path}")
+    print(f"         ({jsonl_path.stat().st_size:,} bytes)")
+    messages = parse_jsonl(jsonl_path)
+    print(f"Parsed {len(messages):,} messages")
+
+    # Derive project + session identifiers
+    session_id = jsonl_path.stem
+    project_name = jsonl_path.parent.name
+
+    # Build bundle components
+    catdef = build_catdef(messages, session_id, project_name)
+    transcript_md = format_markdown(messages, include_tools=True, include_results=args.include_tool_results)
+    bundle_bytes = build_bundle(catdef, transcript_md)
+
+    stats = catdef["x.crossclawd.session"]["stats"]
+    print(f"Built bundle: {len(bundle_bytes):,} bytes")
+    print(f"  Exchanges: {len(catdef['data']['items'])}")
+    print(f"  Found {stats['user_turns']} user / {stats['assistant_turns']} assistant / {stats['tool_calls']} tool — skipped 0 malformed")
+    print(f"  Transcript: {len(transcript_md):,} chars")
 
     if args.out:
         args.out.parent.mkdir(parents=True, exist_ok=True)
         args.out.write_bytes(bundle_bytes)
-        print(f"Wrote: {args.out} ({len(bundle_bytes):,} bytes)")
+        print(f"Wrote: {args.out}")
 
     if args.upload:
+        print(f"Encrypting {len(bundle_bytes):,} bytes...")
         ciphertext, key = encrypt(bundle_bytes)
-        print(f"Encrypted: {len(ciphertext):,} bytes, key: {len(key)*8} bits")
+        print(f"  Ciphertext: {len(ciphertext):,} bytes")
 
         print(f"Uploading to {args.relay} ...")
-        response = upload(args.relay, ciphertext, args.ttl)
+        resp = upload(args.relay, ciphertext, args.ttl)
 
-        code = response.get("display_code") or response.get("code", "?")
+        code = resp.get("display_code") or resp.get("code", "?")
         key_b64 = base64.urlsafe_b64encode(key).decode().rstrip("=")
-        pickup_url = f"{args.relay}/pickup/{code}#{key_b64}"
+        pickup_url = f"{args.relay}/pickup/{resp.get('code', '')}#{key_b64}"
 
         print()
-        print("=" * 60)
-        print(f"  Your pickup code: {code}")
-        print(f"  Expires in: {args.ttl}s")
+        print("=" * 68)
+        print(f"  Pickup code: {code}")
+        print(f"  Expires in:  {args.ttl}s")
         print()
-        print(f"  On your other machine:")
+        print(f"  On the other machine:")
         print(f"    crossclawd pickup {code}")
-        print(f"    (the tool will prompt for the key, or use the URL below)")
+        print(f"    (prompts for key, or use the URL below which embeds it)")
         print()
-        print(f"  Pickup URL (contains the decryption key as #fragment):")
+        print(f"  Pickup URL (#fragment is the decryption key — never sent to server):")
         print(f"    {pickup_url}")
-        print("=" * 60)
+        print("=" * 68)
 
 
 if __name__ == "__main__":

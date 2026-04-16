@@ -58,7 +58,29 @@ The ciphertext wraps a `.opencatalog` CATIO bundle (see [catdef.org](https://cat
 
 ## Status
 
-**v0.1 — proof-of-concept.** The exporter works end-to-end. The relay is specified but not yet deployed.
+**v0.2 — functional exporter.** Auto-discovers Claude Code JSONL transcripts, parses them (ccc-ninja compatible), generates structured catdef v1.3 index AND verbatim markdown transcript, bundles both. Successfully exports a month of conversations (19K messages, 256 MB raw) to a single 1.5 MB portable bundle.
+
+Relay is specified ([ARCHITECTURE.md](ARCHITECTURE.md)) but not yet deployed — run `wrangler dev` for local testing.
+
+### Quick start
+
+```bash
+# List available Claude sessions
+python exporter/export_conversation.py --list
+
+# Export latest session of a project
+python exporter/export_conversation.py --project thingalog --out session.opencatalog
+
+# Export a specific session file
+python exporter/export_conversation.py --jsonl ~/.claude/projects/.../xxx.jsonl --out session.opencatalog
+
+# (Eventually) encrypt + upload to the relay for cross-machine pickup
+python exporter/export_conversation.py --upload
+```
+
+## Sister project
+
+**ccc-ninja** (Claude Code Copier Ninja) — VS Code extension that turned this whole thing real. Parses the same JSONL files into beautiful markdown for email/chat/docs. CrossClawd incorporates a Python port of its parser so the two produce identical transcripts.
 
 ## License
 
