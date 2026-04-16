@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+.env
+.env.local
+node_modules/
+.wrangler/
+dist/
+*.opencatalog
+!exporter/samples/*.opencatalog
